@@ -18,12 +18,12 @@
 typedef struct
 {
 	// sensor data = real data *100 to prevent using float
-	uint32_t humidity;
-	uint32_t temp;
-	uint32_t soil_moisture;
-	uint32_t battery;
+	uint16_t humidity;
+	uint16_t temp;
+	uint16_t soil_moisture;
+	uint16_t battery;
 } sensor_typedef;
 
 
-void aht10_get_data(I2C_HandleTypeDef *i2c, uint8_t i2c_addr, sensor_typedef *m_sensor);
+int aht10_get_data(I2C_HandleTypeDef *i2c, uint8_t i2c_addr, sensor_typedef *m_sensor);
 #endif /* INC_AHT10_H_ */

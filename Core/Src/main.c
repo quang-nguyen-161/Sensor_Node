@@ -1,61 +1,53 @@
 /* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include "cmsis_os.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <stdbool.h>
 #include "AHT10.h"
 #include "SX1278.h"
-/* USER CODE END Includes */
+uint8_t sensor_buffer[25];
+uint8_t receive_buffer[50];
+uint8_t payload[11] = {0};
+uint8_t connected_node[5] = {0};
+/*
+ 0 -> cmd
+ 1 -> dest
+ 2 -> dev_id
+ 3,4 -> temp
+ 5,6 -> humid
+ 7,8 -> moisture
+ 9,10 -> bat
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+ 0 = 0x01 -> node, gateway connection
+ 0 = 0x10 -> node, node connection
+ 0 = 0x02 -> sending data
+ */
 
-/* USER CODE END PTD */
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-/* USER CODE END PD */
+#define dev_id 0x01
+SX1278_hw_t SX1278_hw;
+SX1278_t SX1278;
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
 
-TIM_HandleTypeDef htim2;
-
 UART_HandleTypeDef huart1;
 
+osThreadId ReceiveTaskHandle;
+osThreadId TransmitTaskHandle;
+osThreadId SensorTaskHandle;
+osSemaphoreId dataReadyHandle;
+osSemaphoreId transmitSuccessHandle;
+osSemaphoreId retryHandle;
 /* USER CODE BEGIN PV */
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,393 +57,166 @@ static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_TIM2_Init(void);
-/* USER CODE BEGIN PFP */
+void ReceiveTaskInit(void const * argument);
+void TransmitTaskInit(void const * argument);
+void SensorTaskInit(void const * argument);
 
+/* USER CODE BEGIN PFP */
+void uart_printf(const char *format,...)
+{
+	char buff[128];
+	va_list args;
+	va_start(args, format);
+	int len = vsnprintf(buff, sizeof(buff), format, args);
+	va_end(args);
+
+	if (len > 0) {
+	    if (len > sizeof(buff)) len = sizeof(buff);
+	    HAL_UART_Transmit(&huart1, (uint8_t*)buff, len, 500);
+	}
+}
+
+
+int transmit_mode(uint8_t* buffer,uint32_t size)
+{
+    HAL_Delay(100);
+    uart_printf("Sending package...\n");
+
+    int ret = SX1278_LoRaEntryTx(&SX1278, size, 2000);
+    uart_printf("Entry: %d\n", ret);
+    if (!ret) return 0;
+
+    uart_printf("TX HEX: ");
+    for(int i=0;i<size;i++)
+        uart_printf("%02X ", buffer[i]);
+    uart_printf("\n");
+
+    ret = SX1278_LoRaTxPacket(&SX1278, buffer, size, 2000);
+
+    uart_printf("Transmission: %d\n", ret);
+    uart_printf("Package sent...\n");
+
+    return 1;
+}
+
+int receive_mode(uint8_t* buffer,uint32_t size)
+{
+    int ret;
+    ret = SX1278_LoRaEntryRx(&SX1278, size, 2000);
+    uart_printf("enter receive mode: %d\n", ret);
+    if (!ret) return 0;
+
+    HAL_Delay(800);
+
+    uart_printf("Receiving package...\n");
+
+    ret = SX1278_LoRaRxPacket(&SX1278);
+    uart_printf("Received: %d bytes\n", ret);
+
+    if (ret > 0)
+    {
+        SX1278_read(&SX1278, buffer, ret);
+
+        uart_printf("Content HEX: ");
+        for(int i=0;i<ret;i++)
+        {
+            uart_printf("%02X ", buffer[i]);
+            //get dest = ack
+            if (i == 0) payload[i] = buffer[i];
+        }
+        uart_printf("\n");
+    }
+
+    uart_printf("Package received...\n");
+    return ret;   // <-- IMPORTANT: return number of bytes!
+}
+
+void packet_process(uint8_t *receive_buffer)
+{
+	switch (receive_buffer[0])
+	        {
+				case 0x01:
+				{
+					if (receive_buffer[1] != 0xFF)
+						break;   // not gateway broadcast
+
+					uart_printf("connecting...\n");
+
+					uint8_t connected = 0;
+					uint8_t empty_slot = 0;
+
+					// check only once
+					for (int i = 1; i <= 5; i++)
+					{
+						if (receive_buffer[i] == dev_id)
+						{
+							connected = 1;
+							break;               // already in list → stop
+						}
+
+						if (receive_buffer[i] == 0)
+						{
+							empty_slot = 1;      // remember empty slot
+						}
+					}
+
+					if (connected)
+					{
+						uart_printf("already in connection\n");
+					}
+					else if (empty_slot)
+					{
+						uart_printf("remain slot, add gateway to dest\n");
+						payload[1] = 0xFF;
+						payload[2] = dev_id;
+					}
+					else
+					{
+						uart_printf("no empty slot, cannot join\n");
+					}
+				}
+				break;
+	        	case 0x02:
+	        		 if (receive_buffer[1] != dev_id) break;
+	        		 else
+	        		 {
+	        			 uart_printf("receive data from %02X\n",receive_buffer[2]);
+	        			 break;
+	        		 }
+	        	break;
+	        	case 0x10:
+	        		if (receive_buffer[1] != dev_id) break;
+	        		else if (connected_node[4] != 0) break;
+	        		else
+	        		{
+	        			for (int i = 0;i<5;i++)
+	        			{
+	        				if (receive_buffer[2] == connected_node[i])
+	        				{
+	        					uart_printf("node already connected");
+	        				}
+	        				else if (connected_node[i] == 0)
+	        				{
+	        					connected_node[i] = receive_buffer[2];
+	        					break;
+	        				}
+	        			}
+	        		}
+	        	break;
+	        	default:
+	        	break;
+	        }
+}
+
+sensor_typedef m_sensor;
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-#define NODE_TO_GATEWAY_MODE 1
-#define NODE_TO_NODE_MODE	 0
 
-#define CONTINUOUS_MODE 	 1
-#define TIMER_MODE			 0
-
-#define dev_id 2
-
-#define NODE
-//#define GATEWAY
-
-SX1278_hw_t SX1278_hw;
-SX1278_t SX1278;
-sensor_typedef sensor;
-
-int sensor_mode = CONTINUOUS_MODE;
-int rf_mode;
-int payload[6] = {0};
-int ret;
-char *ack = "255";
-int node_to_node_check = 0;
-char buffer[512] = {0};
-uint32_t data[5] = {0};
-int message;
-int message_length;
-int is_src = 0;
-int connect_to_dest = 0;
-int connected_node[5] = {0};
-int dest;
-void uart_printf(const char *fmt, ...)
-{
-    char buffer[64]={0};   // change size if needed
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-    HAL_UART_Transmit(&huart1, (uint8_t*)buffer, 64, 100);
-}
-uint8_t I2C_CheckDevice(I2C_HandleTypeDef *hi2c, uint8_t addr)
-{
-    // addr must be 7-bit, HAL will shift it automatically
-    if (HAL_I2C_IsDeviceReady(hi2c, addr, 3, 100) == HAL_OK)
-       {
-    	uart_printf("device ok\n");
-    	return 1;
-       }
-    else
-    {
-    	uart_printf("device not ok\n");
-    	return 0;
-    }
-}
-void I2C_Scan(I2C_HandleTypeDef *hi2c)
-{
-    uart_printf("\r\nStarting I2C Scan...\r\n");
-
-    for(uint8_t addr = 1; addr < 128; addr++)
-    {
-        if (HAL_I2C_IsDeviceReady(hi2c, (addr << 1), 2, 10) == HAL_OK)
-        {
-            uart_printf(" - Device found at 0x%02X\r\n", addr);
-        }
-    }
-
-    uart_printf("I2C Scan Completed.\r\n\r\n");
-}
-// --- Return true on success, false on timeout/failure ---
-// node_to_gateway_routing: listen for nodes, add to connected_node[], broadcast gateway ID when room
-bool node_to_gateway_routing(int *connected_node, uint32_t timeout_ms)
-{
-	uart_printf("rssi: %d\n",SX1278_RSSI_LoRa(&SX1278));
-    uart_printf("Waiting for nodes...\r\n");
-    SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-
-    uint32_t start_time = HAL_GetTick();
-    bool any_added = false;
-
-    while (HAL_GetTick() - start_time < timeout_ms)
-    {
-        // Enter RX mode before checking packet
-        ret = SX1278_LoRaRxPacket(&SX1278);
-        if (ret > 0)
-        {
-            // reset timeout when receiving something
-            start_time = HAL_GetTick();
-
-            memset(buffer, 0, sizeof(buffer));
-            SX1278_read(&SX1278, (uint8_t*)buffer, ret);
-
-            int new_id = atoi((char*)buffer);
-            // skip invalid id
-            if (new_id <= 0) {
-                HAL_Delay(10);
-                continue;
-            }
-
-            uart_printf("Received node ID: %d\r\n", new_id);
-
-            // Check for duplicate
-            bool exists = false;
-            for (int i = 0; i < 5; i++)
-            {
-                if (connected_node[i] == new_id)
-                {
-                    exists = true;
-                    break;
-                }
-            }
-
-            // Insert new node if there is an empty slot
-            if (!exists)
-            {
-                for (int i = 0; i < 5; i++)
-                {
-                    if (connected_node[i] == 0)
-                    {
-                        connected_node[i] = new_id;
-                        uart_printf("Node %d added at index %d\r\n", new_id, i);
-                        any_added = true;
-                        break;
-                    }
-                }
-            }
-
-            // Broadcast node ID if still room (last slot empty)
-            if (connected_node[4] == 0)
-            {
-                HAL_Delay(20); // small delay to reduce collision risk
-
-                message_length = sprintf(buffer, "%d", dev_id);
-                uart_printf("Broadcast gateway ID: %s\r\n", buffer);
-
-                SX1278_LoRaEntryTx(&SX1278, message_length, 2000);
-                HAL_Delay(5);
-                SX1278_LoRaTxPacket(&SX1278, (uint8_t*)buffer, message_length, 2000);
-
-                HAL_Delay(80); // give radio time to finish and go back to RX
-            }
-        }
-        else
-        {
-            // no packet this iteration, small sleep to yield CPU
-            HAL_Delay(30);
-        }
-    }
-
-    if (any_added) {
-        uart_printf("Finished listening: nodes discovered.\r\n");
-        return true;
-    } else {
-        uart_printf("Timeout reached without discovering nodes.\r\n");
-        return false;
-    }
-}
-
-
-// node_to_node_routing: send own ID to find relay (up to 5 attempts),
-// then if connected wait and discover neighbour nodes (with timeout)
-bool node_to_node_routing(int id, int *dest, int *connected_node, uint32_t timeout_ms)
-{
-    // 1) If not connected, try to find relay by broadcasting up to 5 times
-    if (!connect_to_dest)
-    {
-        uart_printf("Trying to find relay...\r\n");
-        uint32_t start = HAL_GetTick();
-
-        while (HAL_GetTick() - start < timeout_ms)
-        {
-
-            // Send our ID
-            message_length = sprintf(buffer, "%d", id);
-            SX1278_LoRaEntryTx(&SX1278, message_length, 2000);
-            SX1278_LoRaTxPacket(&SX1278, (uint8_t*)buffer, message_length, 2000);
-
-            HAL_Delay(120); // small guard delay
-        }
-
-            // Enter RX mode and wait for reply with timeout_ms per attempt
-            SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-           start = HAL_GetTick();
-
-            while (HAL_GetTick() - start < timeout_ms)
-            {
-                ret = SX1278_LoRaRxPacket(&SX1278);
-                if (ret > 0)
-                {
-                    memset(buffer, 0, sizeof(buffer));
-                    SX1278_read(&SX1278, (uint8_t*)buffer, ret);
-
-                    int reply_id = atoi((char*)buffer);
-                    if (reply_id > 0)
-                    {
-                        *dest = reply_id;
-                        uart_printf("Connected to relay ID: %d\r\n", *dest);
-
-                        connect_to_dest = 1;
-                        return true;    // success
-                    }
-                }
-                HAL_Delay(10); // small pause inside wait loop
-
-
-
-        }
-
-        uart_printf("Failed to connect to relay after 5 attempts!\r\n");
-        return false;
-    }
-
-    // 2) Already connected: wait for neighbor nodes with a discovery timeout
-    uart_printf("Connected. Waiting for neighbor nodes...\r\n");
-
-    uint32_t start_time = HAL_GetTick();
-    bool any_added = false;
-
-    while (HAL_GetTick() - start_time < timeout_ms)
-    {
-        // Enter RX mode
-        SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-
-        ret = SX1278_LoRaRxPacket(&SX1278);
-        if (ret > 0)
-        {
-            // reset timeout when receiving something
-            start_time = HAL_GetTick();
-
-            memset(buffer, 0, sizeof(buffer));
-            SX1278_read(&SX1278, (uint8_t*)buffer, ret);
-
-            int new_id = atoi((char*)buffer);
-            if (new_id <= 0) {
-                HAL_Delay(10);
-                continue;
-            }
-
-            uart_printf("Received node ID: %d\r\n", new_id);
-
-            // Check duplicate
-            bool exists = false;
-            for (int i = 0; i < 5; i++)
-            {
-                if (connected_node[i] == new_id)
-                {
-                    exists = true;
-                    break;
-                }
-            }
-
-            // Insert if new
-            if (!exists)
-            {
-                for (int i = 0; i < 5; i++)
-                {
-                    if (connected_node[i] == 0)
-                    {
-                        connected_node[i] = new_id;
-                        uart_printf("Node %d added at index %d\r\n", new_id, i);
-                        any_added = true;
-                        break;
-                    }
-                }
-            }
-
-            // Broadcast own ID if relay still needs nodes
-            if (connected_node[4] == 0)
-            {
-                HAL_Delay(20);
-
-                message_length = sprintf(buffer, "%d", id);
-                uart_printf("Broadcast node ID to help discovery: %s\r\n", buffer);
-
-                SX1278_LoRaEntryTx(&SX1278, message_length, 2000);
-                HAL_Delay(5);
-                SX1278_LoRaTxPacket(&SX1278, (uint8_t*)buffer, message_length, 2000);
-
-                HAL_Delay(80);
-            }
-        }
-        else
-        {
-            // no packet
-            HAL_Delay(20);
-        }
-    }
-
-    if (any_added) {
-        uart_printf("Node discovery finished (nodes added).\r\n");
-    } else {
-        uart_printf("Node discovery timed out (no nodes added).\r\n");
-    }
-    return true; // connected (even if no new nodes added)
-}
-
-
-// check_mode: decide whether node->gateway or node->node mode by reading a single packet
-int check_mode(int *dest, int *connected_node_array, uint32_t listen_ms)
-{
-    memset(buffer, 0, sizeof(buffer));
-
-    // ensure we are in RX before waiting
-    SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-
-    uint32_t start = HAL_GetTick();
-    // wait up to listen_ms for a packet
-    while (HAL_GetTick() - start < listen_ms)
-    {
-        ret = SX1278_LoRaRxPacket(&SX1278);
-        if (ret > 0)
-        {
-            SX1278_read(&SX1278, (uint8_t*)buffer, ret);
-            uart_printf("check_mode rx: %s\n", buffer);
-            break;
-        }
-        HAL_Delay(10);
-    }
-
-    int temp = atoi((char*)buffer);
-    if (temp == 255)
-    {
-        uart_printf("node to gateway mode\r\n");
-
-        // LED on to indicate gateway mode
-        HAL_GPIO_WritePin(LED_PIN_GPIO_Port, LED_PIN_Pin, GPIO_PIN_SET);
-
-        // Listen and populate connected_node_array for up to 10s
-        node_to_gateway_routing(connected_node_array, 10000);
-        *dest = 0;
-        return NODE_TO_GATEWAY_MODE;
-    }
-    else
-    {
-        uart_printf("node to node mode\r\n");
-
-        HAL_GPIO_WritePin(LED_PIN_GPIO_Port, LED_PIN_Pin, GPIO_PIN_RESET);
-
-        // Now attempt node-to-node routing (needs own id and dest variable)
-        // Ensure you have 'dev_id' or pass node id here. Example using dev_id:
-        node_to_node_routing(dev_id, dest, connected_node_array, 2000);
-        return NODE_TO_NODE_MODE;
-    }
-}
-
-
-
-void get_sensor()
-{
-	HAL_GPIO_TogglePin(LED_PIN_GPIO_Port, LED_PIN_Pin);
-}
 /* USER CODE END 0 */
-void set_timer(uint32_t time_ms)
-{
-	TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-	  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-	  /* USER CODE BEGIN TIM2_Init 1 */
-
-	  /* USER CODE END TIM2_Init 1 */
-	  htim2.Instance = TIM2;
-	  htim2.Init.Prescaler = 8000-1;
-	  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-	  htim2.Init.Period = time_ms-1;
-	  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-	  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-	  {
-	    Error_Handler();
-	  }
-	  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-	  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-	  {
-	    Error_Handler();
-	  }
-	  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-	  {
-	    Error_Handler();
-	  }
-}
 /**
   * @brief  The application entry point.
   * @retval int
@@ -459,7 +224,6 @@ void set_timer(uint32_t time_ms)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -468,14 +232,12 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -484,69 +246,72 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
-  //MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  SX1278_hw.dio0.port =GPIOA;
+    	SX1278_hw.dio0.pin = GPIO_PIN_2;
+    	SX1278_hw.nss.port = GPIOA;
+    	SX1278_hw.nss.pin = GPIO_PIN_4;
+    	SX1278_hw.reset.port = GPIOA;
+    	SX1278_hw.reset.pin = GPIO_PIN_3;
+    	SX1278_hw.spi = &hspi1;
 
-  //HAL_TIM_Base_Start_IT(&htim2);
-  	I2C_Scan(&hi2c1);
-  	SX1278_hw.dio0.port =GPIOA;
-  	SX1278_hw.dio0.pin = GPIO_PIN_2;
-  	SX1278_hw.nss.port = GPIOA;
-  	SX1278_hw.nss.pin = GPIO_PIN_4;
-  	SX1278_hw.reset.port = GPIOA;
-  	SX1278_hw.reset.pin = GPIO_PIN_3;
-  	SX1278_hw.spi = &hspi1;
+    	SX1278.hw = &SX1278_hw;
 
-  	SX1278.hw = &SX1278_hw;
-
-  	uart_printf("Configuring LoRa module\r\n");
-  	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
-  	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 10);
-  	uart_printf("Done configuring LoRaModule\r\n");
-  	ret = SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-  	//enable invert IQ to communicate with gateway
-
-
-  	//rf_mode = check_mode(&dest, connected_node, 10000);
-
-
-  //	payload[0] = dest;
-  //	payload[1] = dev_id;
-
+    	uart_printf("Configuring LoRa module\r\n");
+    	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
+    	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 10);
+    	uart_printf("Done configuring LoRaModule\r\n");
+    	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
   /* USER CODE END 2 */
 
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* Create the semaphores(s) */
+  /* definition and creation of dataReady */
+  osSemaphoreDef(dataReady);
+  dataReadyHandle = osSemaphoreCreate(osSemaphore(dataReady), 1);
+
+  /* definition and creation of transmitSuccess */
+  osSemaphoreDef(transmitSuccess);
+  transmitSuccessHandle = osSemaphoreCreate(osSemaphore(transmitSuccess), 1);
+
+  /* definition and creation of retry */
+  osSemaphoreDef(retry);
+  retryHandle = osSemaphoreCreate(osSemaphore(retry), 1);
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of ReceiveTask */
+  osThreadDef(ReceiveTask, ReceiveTaskInit, osPriorityNormal, 0, 256);
+  ReceiveTaskHandle = osThreadCreate(osThread(ReceiveTask), NULL);
+
+
+
+  /* definition and creation of SensorTask */
+  osThreadDef(SensorTask, SensorTaskInit, osPriorityBelowNormal, 0, 256);
+  SensorTaskHandle = osThreadCreate(osThread(SensorTask), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* USER CODE END RTOS_THREADS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-#ifdef NODE
-
-
-	     node_to_node_routing(1, dest, connected_node, 2000);
-#endif
-#ifdef GATEWAY
-
-	  			uart_printf("gateway ...\r\n");
-	  						HAL_Delay(1000);
-	  						uart_printf("Sending package...\r\n");
-
-	  						message_length = sprintf(buffer,"%d",0xFF);
-	  						ret = SX1278_LoRaEntryTx(&SX1278, message_length, 2000);
-	  						uart_printf("Entry: %d\r\n", ret);
-
-	  						uart_printf("Sending %s\r\n", buffer);
-	  						ret = SX1278_LoRaTxPacket(&SX1278, (uint8_t*) buffer,
-	  								message_length, 2000);
-
-
-	  						uart_printf("Transmission: %d\r\n", ret);
-	  						uart_printf("Package sent...\r\n");
-#endif
-  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
   /* USER CODE END 3 */
 }
 
@@ -563,10 +328,13 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -575,10 +343,10 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
   {
@@ -601,13 +369,11 @@ static void MX_ADC1_Init(void)
 {
 
   /* USER CODE BEGIN ADC1_Init 0 */
-
   /* USER CODE END ADC1_Init 0 */
 
   ADC_ChannelConfTypeDef sConfig = {0};
 
   /* USER CODE BEGIN ADC1_Init 1 */
-
   /* USER CODE END ADC1_Init 1 */
   /** Common config
   */
@@ -632,7 +398,6 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN ADC1_Init 2 */
-
   /* USER CODE END ADC1_Init 2 */
 
 }
@@ -646,11 +411,9 @@ static void MX_I2C1_Init(void)
 {
 
   /* USER CODE BEGIN I2C1_Init 0 */
-
   /* USER CODE END I2C1_Init 0 */
 
   /* USER CODE BEGIN I2C1_Init 1 */
-
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
@@ -666,7 +429,6 @@ static void MX_I2C1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
-
   /* USER CODE END I2C1_Init 2 */
 
 }
@@ -680,11 +442,9 @@ static void MX_SPI1_Init(void)
 {
 
   /* USER CODE BEGIN SPI1_Init 0 */
-
   /* USER CODE END SPI1_Init 0 */
 
   /* USER CODE BEGIN SPI1_Init 1 */
-
   /* USER CODE END SPI1_Init 1 */
   /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
@@ -704,53 +464,7 @@ static void MX_SPI1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SPI1_Init 2 */
-
   /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 8000-1;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 5000-1;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -763,11 +477,9 @@ static void MX_USART1_UART_Init(void)
 {
 
   /* USER CODE BEGIN USART1_Init 0 */
-
   /* USER CODE END USART1_Init 0 */
 
   /* USER CODE BEGIN USART1_Init 1 */
-
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
@@ -782,7 +494,6 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -798,6 +509,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
@@ -829,15 +541,85 @@ static void MX_GPIO_Init(void)
 
 }
 
-/* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+void ReceiveTaskInit(void const * argument)
 {
-    if (htim->Instance == TIM2)  // check correct timer
+    while(1)
     {
-       get_sensor();
+        int len = receive_mode(receive_buffer,sizeof(receive_buffer));
+
+        if (len > 0)
+        {
+            uart_printf("receive success\n");
+        }
+        else
+        {
+            uart_printf("receive fail, retry...\n");
+
+        }
+
+        packet_process(receive_buffer);
+        osSemaphoreRelease(dataReadyHandle);
+        osDelay(100);
     }
 }
-/* USER CODE END 4 */
+
+
+
+void SensorTaskInit(void const * argument)
+{
+    while(1)
+    {
+        if(osSemaphoreWait(dataReadyHandle, osWaitForever) == osOK)
+        {
+            if(aht10_get_data(&hi2c1, AHT10_ADDRESS, &m_sensor))
+            {
+            	payload[2] = dev_id;
+            	payload[3] = (uint8_t)(m_sensor.temp >> 8); // high byte
+            	payload[4] = (uint8_t)(m_sensor.temp & 0xFF); // low byte
+
+            	payload[5] = (uint8_t)(m_sensor.humidity >> 8); // high byte
+            	payload[6] = (uint8_t)(m_sensor.humidity & 0xFF); // low byte
+                uart_printf("sensor receive success\n");
+                uart_printf("temp: %d, humid: %d\n",m_sensor.temp,m_sensor.humidity);
+                uart_printf("passing semaphore to transmit task\n");
+
+                uart_printf("transmit sensor value\n");
+                		  if(transmit_mode(payload,sizeof(payload)))
+                		  {
+                			  uart_printf("transmit data success to:%02X, from:%02X\n",payload[1],payload[2]);
+                		  }
+                		  else
+                		  {
+                			  uart_printf("transmit data fail\n");
+                		  }
+
+
+
+            }
+            else
+            {
+                uart_printf("sensor data not ready, going back to receive task\n");
+
+        }
+
+    }
+}}
+
+
+
+
+
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM4) {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -846,11 +628,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
   /* USER CODE END Error_Handler_Debug */
 }
 
@@ -865,8 +642,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
