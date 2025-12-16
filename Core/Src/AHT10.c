@@ -43,8 +43,40 @@ int aht10_get_data(I2C_HandleTypeDef *i2c, uint8_t i2c_addr, sensor_typedef *m_s
 		     m_sensor->temp =(uint16_t) (((float)raw_temp * 200.0f / 1048576.0f - 50.0f)*100);
 		     return 1;
 	}
+	return 1;
 }
 
+uint16_t read_adc_once(ADC_HandleTypeDef *hadc)
+{
+    HAL_ADC_Start(hadc);
 
+    // wait for conversion
+    if (HAL_ADC_PollForConversion(hadc, 10) != HAL_OK)
+        return 0; // timeout or error
+
+    uint16_t val = HAL_ADC_GetValue(hadc);
+
+    HAL_ADC_Stop(hadc);
+
+    return val;
+}
+
+float map_adc_to_percent(uint16_t adc, uint32_t ADC_DRY, uint32_t ADC_WET)
+{
+    float v = adc;
+    float dry = ADC_DRY;
+    float wet = ADC_WET;
+    float pct;
+
+    if (wet < dry)
+        pct = (dry - v) / (dry - wet);
+    else
+        pct = (v - dry) / (wet - dry);
+
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 1.0f) pct = 1.0f;
+
+    return pct * 100.0f;
+}
 
 
