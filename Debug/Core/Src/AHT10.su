@@ -1,4 +1,4 @@
 AHT10.c:15:6:aht10_init	32	static
 AHT10.c:22:5:aht10_get_data	48	static
-AHT10.c:49:10:read_adc_once	24	static
-AHT10.c:64:7:map_adc_to_percent	48	static
+AHT10.c:48:10:read_adc_once	24	static
+AHT10.c:63:7:map_adc_to_percent	48	static

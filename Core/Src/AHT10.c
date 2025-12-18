@@ -28,8 +28,7 @@ int aht10_get_data(I2C_HandleTypeDef *i2c, uint8_t i2c_addr, sensor_typedef *m_s
 	aht10_init(i2c, i2c_addr);
 
 	HAL_I2C_Master_Receive(i2c, i2c_addr, receive_buff, sizeof(receive_buff), 100);
-	if ((receive_buff[0] & 0x80)) return 0;
-	else
+
 	if (!(receive_buff[0] & 0x80))
 	{
 		 raw_RH = ((uint16_t)receive_buff[1] << 12) |
