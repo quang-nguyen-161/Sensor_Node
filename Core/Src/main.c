@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "AHT10.h"
@@ -16,18 +17,22 @@
 #define SENSOR_PACKET_LEN   8    // sensor fields you copy into TX (3..10 -> 8 bytes)
 #define CONNECTED_NODE_COUNT 5
 
+#define dev_id 0x18
 
 uint8_t transmit_packet[60] = {0};   // same size you used previously
 uint8_t sensor_packet[SENSOR_PACKET_LEN] = {0};
+uint8_t forward_sensor_packet[SENSOR_PACKET_LEN] = {0};
 uint8_t con_dev = 0;                 // number of connected devices (maintain consistently)
 uint8_t connected_node[CONNECTED_NODE_COUNT] = {0};
 uint8_t dest = 0xFF;                 // default destination (0xFF = broadcast)
 uint8_t receive_packet[60];
 uint8_t connected_to_gateway = 0;
 uint32_t gateway_timeout_check;
+uint32_t node_timeout_check;
 uint8_t connected_to_node = 0;
-
+uint32_t node_dev_timeout_check[5] = {0};
 uint32_t transmit_packet_size;
+uint8_t forward_packet;
 /*
  0 -> cmd
  1 -> dest
@@ -43,7 +48,7 @@ uint32_t transmit_packet_size;
  */
 
 
-#define dev_id 0x18
+
 
 SX1278_hw_t SX1278_hw;
 SX1278_t SX1278;
@@ -94,8 +99,7 @@ void uart_printf(const char *format,...)
 
 int transmit_mode(uint8_t* packet, uint32_t size)
 {
-    uart_printf("[TX] Sending package...\n");
-    HAL_Delay(200);
+	HAL_Delay(100 + (rand() % 500));
     int ret = SX1278_LoRaEntryTx(&SX1278, size, 2000);
     uart_printf("[TX] Transmit mode: %d\n", ret);
     if (!ret) return 0;
@@ -104,21 +108,23 @@ int transmit_mode(uint8_t* packet, uint32_t size)
     for(int i=0;i<size;i++)
         uart_printf("%02X ", packet[i]);
     uart_printf("\n");
-
+    HAL_Delay(100 + (rand() % 500));
     ret = SX1278_LoRaTxPacket(&SX1278, packet, size, 2000);
+    HAL_Delay(100 + (rand() % 500));
     if (!ret) return 0;
     uart_printf("[TX] Transmit OK: %d\n", ret);
     return 1;
 }
 
-int receive_mode(uint8_t* packet,uint32_t size)
+int receive_mode(uint8_t* packet, uint32_t size)
 {
     int ret;
+    HAL_Delay(400 + (rand() % 500));
     ret = SX1278_LoRaEntryRx(&SX1278, size, 2000);
     uart_printf("[RX] Receive mode: %d\n", ret);
     if (!ret) return 0;
 
-    HAL_Delay(800);
+    HAL_Delay(400 + (rand() % 500));
 
     ret = SX1278_LoRaRxPacket(&SX1278);
     uart_printf("[RX] Received: %d bytes\n", ret);
@@ -127,7 +133,7 @@ int receive_mode(uint8_t* packet,uint32_t size)
     {
         SX1278_read(&SX1278, packet, ret);
         // print gateway or dev target only
-
+        if ((ret == 7) || (ret == 12) || (ret == 6))
         for(int i=0;i<ret;i++)
         {
             uart_printf("%02X ", packet[i]);
@@ -135,10 +141,9 @@ int receive_mode(uint8_t* packet,uint32_t size)
         }
         uart_printf("\n");
     }
-
+    HAL_Delay(100 + (rand() % 500));
     return ret;   // <-- IMPORTANT: return number of bytes!
 }
-
 
 
 uint32_t packet_build(uint8_t cmd, uint8_t *transmit_packet)
@@ -146,44 +151,53 @@ uint32_t packet_build(uint8_t cmd, uint8_t *transmit_packet)
     if (transmit_packet == NULL) return 0;
 
     switch (cmd)
-    {
-    	// handle gateway connection
+    {	// use for connection to gateway
         case 0x01:
             // Gateway broadcast response / connection handshake packet
 
             transmit_packet[0] = 0x01;
-            transmit_packet[1] = 0xFF;         // gateway broadcast dest
-            transmit_packet[2] = dev_id;
-            return 3;
+            transmit_packet[1] = dev_id;
+            return 2;
             break;
-        // send own sensor data
+        // use for sending data from type 1 node
         case 0x02:
             // Data packet: copy sensor_packet into bytes 3..10 (8 bytes)
             transmit_packet[0] = 0x02;
-            transmit_packet[1] = dest;         // send to current dest
-            transmit_packet[2] = dev_id;
+
+            transmit_packet[1] = dev_id;
             // Defensive copy: ensure sensor_packet has SENSOR_PACKET_LEN bytes
-            for (int i = 3; i < 11; i++)
+            for (int i = 2; i < 10; i++)
             {
-                int idx = i - 3;
+                int idx = i - 2;
                 if (idx < SENSOR_PACKET_LEN)
                     transmit_packet[i] = sensor_packet[idx];
                 else
                     transmit_packet[i] = 0;
             }
-            int size = 11;
-            // Optionally merge/aggregate per connected nodes
-            for (int i = 0; i < con_dev; i++)
-            {
-                if (i < CONNECTED_NODE_COUNT && connected_node[i] != 0)
-                {
-                    size = merge_packet(transmit_packet, size, connected_node[i]);
-                }
-            }
-
-            return size;
+            return 10;
             break;
 
+        // use for type 2 node to forward to type 1 node
+        case 0x20:
+        transmit_packet[0] = 0x20;
+        transmit_packet[1] = dest;
+        transmit_packet[2] = dev_id;
+
+        for (int i = 3; i < 11; i++)
+                    {
+                        int idx = i - 3;
+                        if (idx < SENSOR_PACKET_LEN)
+                        {
+                        	if (connected_to_gateway && (!connected_to_node))
+                            transmit_packet[i] = forward_sensor_packet[idx];
+                        	else if ((!connected_to_gateway) && (connected_to_node))
+                        		transmit_packet[i] = sensor_packet[idx];
+                        }
+                        else
+                            transmit_packet[i] = 0;
+                    }
+                    return 11;
+       	break;
         case 0x11:
             // response with 0x11 (you previously set 0x11 for response)
             // but when building 0x10 we will construct a 0x11 response packet
@@ -200,10 +214,8 @@ uint32_t packet_build(uint8_t cmd, uint8_t *transmit_packet)
 
         case 0x10:
         	transmit_packet[0] = 0x10;
-        	transmit_packet[1] = dest;
-        	transmit_packet[2] = dev_id;
-
-        	  return 3;
+        	transmit_packet[1] = dev_id;
+        	  return 2;
         break;
         default:
             // unknown command — leave packet zeroed or set an error code
@@ -224,19 +236,12 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         case 0x01:   // gateway broadcast: check slots / join logic
         {
             // Expect at least 7 bytes (0..6) for the list check
-            if (size != 7)
+            if (size != 6)
             {
                 uart_printf("[01] pkt 0x01 not from gateway (size=%d)\n", size);
+
                 break;
             }
-
-            if (receive_packet[1] != 0xFF)
-            {
-                // Not gateway broadcast
-                break;
-            }
-
-            uart_printf("[01] connecting...\n");
 
             uint8_t connected = 0;
             uint8_t empty_slot = 0;
@@ -247,7 +252,6 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
                 if (receive_packet[i] == dev_id)
                 {
                 	connected = 1;
-
                     break; // already listed
                 }
                 if (receive_packet[i] == 0)
@@ -258,7 +262,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 
             if (connected && (!connected_to_node))
             {
-                uart_printf("[01] node %02X already in connection\n", dev_id);
+                uart_printf("[01] node %02X in connection\n", dev_id);
                 connected_to_gateway = 1;
                 connected_to_node = 0;
                 gateway_timeout_check = HAL_GetTick();
@@ -267,10 +271,9 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
             {
                 // Set dest to gateway (broadcast address in byte[1] of pkt is 0xFF, but gateway may be answering with its own id in another flow)
                 // If you expect gateway id in different byte, adjust accordingly.
-                dest = 0xFF;
                 uart_printf("[01] gateway remain slot, add %02X to slot\n", dev_id);
                 // Optionally build a response join packet
-                transmit_packet_size = packet_build(0x01, transmit_packet);
+
             }
             else
             {
@@ -280,66 +283,48 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         }
         break;
 
-        case 0x02:  // data packet from another node
+        // forward packet
+        case 0x20:
+        if (size != 11) break;
+        if  (receive_packet[1] != dev_id) break;
+        int connected = 0;
+        for (int i = 0;i < 5;i++)
         {
-            // Ensure packet has minimal expected length (at least headers + sensor)
-            if (size < 3)
-            {
-                uart_printf("[02] pkt 0x02 too short\n");
-                break;
-            }
-
-            // If packet is not addressed to this node, ignore
-            if (receive_packet[1] != dev_id)
-            {
-                break;
-            }
-
-            uart_printf("[02] receive data from %02X\n", receive_packet[2]);
-
-            // If we have any connected nodes, forward/aggregate
-            uint8_t any_connected = 0;
-            for (int i = 0; i < con_dev; i++)
-            {
-                if (connected_node[i] != 0)
-                {
-                    any_connected = 1;
-                    break;
-                }
-            }
-
-            if (any_connected)
-            {
-
-                // Build a transmit packet for forwarding
-                packet_build(0x02, transmit_packet);
-            }
+        	if (connected_node[i] == receive_packet[2])
+        	{
+        		connected = 1;
+        		break;
+        	}
+        }
+        if (connected)
+        {
+        	forward_packet = 1;
+        	for (int i=0; i < SENSOR_PACKET_LEN; i++)
+        	{
+        		forward_sensor_packet[i] = receive_packet[i+3];
+        	}
         }
         break;
 
         case 0x10:  // node join request to this node
         {
-            if (size < 3) break;
-            // If the packet isn't for this device, ignore
-            if (receive_packet[1] != dev_id) break;
-
+            if (size != 2) break;
             // If node list is full (connected_node[4] != 0), ignore
             if (connected_node[CONNECTED_NODE_COUNT - 1] != 0) break;
 
             // Try to register the new node id (receive_packet[2]) in first free slot
-            uint8_t new_node = receive_packet[2];
+            uint8_t new_node = receive_packet[1];
             for (int i = 0; i < CONNECTED_NODE_COUNT; i++)
             {
                 if (connected_node[i] == new_node)
                 {
                     uart_printf("[10] node %02X already connected with %02X\n",new_node, dev_id);
-                    con_dev = 1;
                     break;
                 }
                 else if (connected_node[i] == 0)
                 {
                     connected_node[i] = new_node;
-                    packet_build(0x11, transmit_packet);
+
                     uart_printf("[10] node %02X added to %02X\n", new_node, dev_id);
                     break;
                 }
@@ -350,7 +335,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         case 0x11:  // gateway response to a join (or similar)
         {
             // Expect the packet to include gateway id in receive_packet[1] and the node list in 2..6
-            if (size < 7)
+            if (size != 7)
             {
                 uart_printf("[11] pkt 0x11 too short\n");
                 break;
@@ -378,16 +363,17 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
             {
                 uart_printf("[11] node %02X already in connection\n", dev_id);
                 connected_to_node = 1;
+                dest = receive_packet[1];
                 connected_to_gateway = 0;
+                node_timeout_check = HAL_GetTick();
             }
             else if (empty_slot)
             {
 
                 // set dest to gateway's id reported in byte 1
-                dest = receive_packet[1];
+
                 uart_printf("[11] dest %02X remain slot, add node %02X to dest\n", dest, dev_id);
                 // build and (optionally) send a join packet to gateway
-                packet_build(0x10, transmit_packet);
             }
             else
             {
@@ -406,19 +392,43 @@ void timeout_check(uint32_t timeout_ms)
 {
      uint32_t now = HAL_GetTick();
 
-        if (connected_to_gateway)
-        {
-            if (now - gateway_timeout_check > timeout_ms)
-            {
-                uart_printf("[TIME] Device %02X OFFLINE\n", dev_id);
-
-                gateway_timeout_check = 0;
-
-                connected_to_gateway = 0;   // optional: remove
-            }
-        }
+     if (connected_to_gateway && (!connected_to_node))
+     {
+    	 if ((now - gateway_timeout_check) > timeout_ms)
+    	 {
+    		 connected_to_gateway = 0;
+    		 uart_printf("disconnect from gateway");
+    	 }
+     }
+     else if ((!connected_to_gateway) && connected_to_node)
+     {
+    	 if ((now - node_timeout_check) > timeout_ms)
+    	     	 {
+    	     		 connected_to_node = 0;
+    	     		 uart_printf("disconnect from node %02X", dest);
+    	     	 }
+     }
 }
 
+void node_check(uint32_t timeout_ms)
+{
+     uint32_t now = HAL_GetTick();
+
+    for (int i = 0; i < 5; i++)
+    {
+        if (connected_node[i] != 0 )
+        {
+            if ((now - node_dev_timeout_check[i]) > timeout_ms)
+            {
+                uart_printf("Device %02X OFFLINE\n", connected_node[i]);
+
+                node_dev_timeout_check[i] = 0;
+
+                connected_node[i] = 0x00;   // optional: remove
+            }
+        }
+    }
+}
 sensor_typedef m_sensor;
 /* USER CODE END PFP */
 
@@ -458,6 +468,8 @@ int main(void)
   MX_USART1_UART_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
+  srand(HAL_GetTick());
+
   SX1278_hw.dio0.port =GPIOA;
     	SX1278_hw.dio0.pin = GPIO_PIN_2;
     	SX1278_hw.nss.port = GPIOA;
@@ -469,10 +481,12 @@ int main(void)
     	SX1278.hw = &SX1278_hw;
 
     	uart_printf("Configuring LoRa module\r\n");
-    	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
-    	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 10);
+    	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_10,
+    	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_7, SX1278_LORA_CRC_EN, 15);
     	uart_printf("Done configuring LoRaModule\r\n");
     	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
+    	for (int i=0;i<8;i++)
+    		sensor_packet[i] = dev_id;
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -483,32 +497,16 @@ int main(void)
   osSemaphoreDef(dataReady);
   dataReadyHandle = osSemaphoreCreate(osSemaphore(dataReady), 1);
 
-  /* definition and creation of transmitSuccess */
-  osSemaphoreDef(transmitSuccess);
-  transmitSuccessHandle = osSemaphoreCreate(osSemaphore(transmitSuccess), 1);
-
-  /* definition and creation of retry */
-  osSemaphoreDef(retry);
-  retryHandle = osSemaphoreCreate(osSemaphore(retry), 1);
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* definition and creation of ReceiveTask */
-  osThreadDef(ReceiveTask, ReceiveTaskInit, osPriorityNormal, 0, 128);
+  osThreadDef(ReceiveTask, ReceiveTaskInit, osPriorityNormal, 0, 192);
   ReceiveTaskHandle = osThreadCreate(osThread(ReceiveTask), NULL);
 
 
 
   /* definition and creation of SensorTask */
-  osThreadDef(SensorTask, SensorTaskInit, osPriorityBelowNormal, 0, 400	);
+  osThreadDef(SensorTask, SensorTaskInit, osPriorityBelowNormal, 0, 450	);
   SensorTaskHandle = osThreadCreate(osThread(SensorTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -757,7 +755,7 @@ void ReceiveTaskInit(void const * argument)
 
     while(1)
     {
-
+    	forward_packet = 0;
         int len = receive_mode(receive_packet,sizeof(receive_packet));
 
         if (len > 0)
@@ -771,9 +769,24 @@ void ReceiveTaskInit(void const * argument)
 
         }
 
+        osDelay(200 + (rand() % 100));
+        if (connected_to_gateway)
+        {
+        uint32_t emitt_size = packet_build(0x11, transmit_packet);
+            	uart_printf("[TX] Emit connected nodes\n");
+            	if (!transmit_mode(transmit_packet, emitt_size))
+            	{
+            	      uart_printf("[TX]  FAIL\n");
+            	}
+            	else
+                {
+          	        uart_printf("[TX]  OK\n");
+            	}
+            	osDelay(200 + (rand() % 100));   // Small delay between cycles
+        }
 
         osSemaphoreRelease(dataReadyHandle);
-        osDelay(1000);
+        osDelay(500 + (rand() % 100));
     }
 }
 
@@ -789,29 +802,29 @@ void SensorTaskInit(void const * argument)
         /* ------------------------------------------------------
          *  1. JOIN NETWORK (only once)
          * ------------------------------------------------------ */
-        timeout_check(10000);
+
         while(!(connected_to_gateway || connected_to_node))
         {
         	 /* Send broadcast connect packet 0x01 */
-        	        uint32_t    size = packet_build(0x01, transmit_packet);
+
         	            uart_printf("[TX] Send broadcast (0x01) from %02X \n", dev_id);
-        	            transmit_mode(transmit_packet, size);
+        	            transmit_packet_size = packet_build(0x01, transmit_packet);
+        	            transmit_mode(transmit_packet, transmit_packet_size);
+        	            if (connected_to_gateway) break;
+
+            osDelay(200 + (rand() % 100));
 
 
-            osDelay(200);
 
-            if (connected_to_gateway)
-                break;
-            else
-            {
             /* Send join request 0x10 */
-                        size = packet_build(0x10, transmit_packet);
                         uart_printf("[TX] Send join request (0x10) from %02X \n", dev_id);
-                        transmit_mode(transmit_packet, size);
-            }
+                        transmit_packet_size = packet_build(0x10, transmit_packet);
+                        transmit_mode(transmit_packet, transmit_packet_size);
+                        if (connected_to_node)  break;
+          }
 
-            osDelay(200);
-        }
+            osDelay(200 + (rand() % 100));
+
 
         /* ------------------------------------------------------
          *  2. READ SENSOR DATA
@@ -834,30 +847,30 @@ void SensorTaskInit(void const * argument)
         /* ------------------------------------------------------
          *  3. BUILD + SEND SENSOR PACKET (0x02)
          * ------------------------------------------------------ */
-        uint32_t tx_size = packet_build(0x02, transmit_packet);
-
-        if (!transmit_mode(transmit_packet, tx_size))
+        uint32_t tx_size;
+        if (connected_to_gateway && (!connected_to_node))
         {
-            uart_printf("[TX] Sensor transmit FAIL\n");
+        // send own's sensor packet
+         tx_size = packet_build(0x02, transmit_packet);
+         transmit_mode(transmit_packet, tx_size);
+         if (forward_packet)
+         {
+        	 HAL_Delay(200 + (rand() % 100));
+        	 tx_size = packet_build(0x20, transmit_packet);
+        	 transmit_mode(transmit_packet, tx_size);
+         }
+
+
         }
-        else
+        else if ((!connected_to_gateway) && connected_to_node )
         {
-            uart_printf("[TX] Sensor transmit OK\n");
+         tx_size = packet_build(0x20, transmit_packet);
+         transmit_mode(transmit_packet, tx_size);
         }
-        osDelay(200);   // Small delay between cycles
+        osDelay(200 + (rand() % 100));   // Small delay between cycles
 
 
-    	uint32_t emitt_size = packet_build(0x11, transmit_packet);
-    	uart_printf("[TX] Emit connected nodes\n");
-    	if (!transmit_mode(transmit_packet, emitt_size))
-    	{
-    	      uart_printf("[TX]  FAIL\n");
-    	}
-    	else
-        {
-  	        uart_printf("[TX]  OK\n");
-    	}
-    	osDelay(200);   // Small delay between cycles
+
     }
 }
 
