@@ -14,7 +14,7 @@
 #define SENSOR_PACKET_LEN   8    // sensor fields you copy into TX (3..10 -> 8 bytes)
 #define CONNECTED_NODE_COUNT 5
 
-#define dev_id 0x36
+#define dev_id 0x23
 
 #define GATEWAY_ADV_CMD 0X22
 #define GATEWAY_BEACON_CMD 0X33
@@ -25,17 +25,19 @@
 #define SENSOR_PACKET_CMD 0X02
 #define FORWARD_PACKET_CMD 0X20
 #define CONFIG_PACKET_CMD 0xCF
-#define TDMA_SLOT_TIME 2000
+
+
+#define TDMA_SLOT_TIME 6000
 #define TDMA_GUARD_TIME 400
-#define TDMA_TX_TIME 1200
+
 
 #define TDMA_NUM_SLOTS 5
 
 #define TDMA_CHILD_NUM_SLOTS 5
 
-#define TDMA_CHILD_SLOT_TIME 800
+#define TDMA_CHILD_SLOT_TIME 2000
 #define TDMA_CHILD_GUARD_TIME 100
-#define TDMA_CHILD_TX_TIME 600
+
 
 uint8_t transmit_packet[70] = {0};   // same size you used previously
 uint8_t sensor_packet[SENSOR_PACKET_LEN] = {0};
@@ -64,20 +66,19 @@ uint8_t slot_sent = 0;
 SX1278_hw_t SX1278_hw;
 SX1278_t SX1278;
 
+/* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c1;
+
+RTC_HandleTypeDef hrtc;
 
 SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
 
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_ADC1_Init(void);
+RTC_TimeTypeDef time;
+RTC_DateTypeDef date;
 
 void uart_printf(const char *format,...)
 {
@@ -91,6 +92,33 @@ void uart_printf(const char *format,...)
 	    if (len > sizeof(packet)) len = sizeof(packet);
 	    HAL_UART_Transmit(&huart1, (uint8_t*)packet, len, 500);
 	}
+}
+
+void RTC_SetAlarmIn(uint32_t delay_sec)
+{
+    RTC_TimeTypeDef time;
+    RTC_DateTypeDef date;
+    RTC_AlarmTypeDef alarm = {0};
+
+    HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN);
+
+    uint32_t total =
+        time.Hours * 3600 +
+        time.Minutes * 60 +
+        time.Seconds +
+        delay_sec;
+
+    total %= 24 * 3600;
+
+    alarm.AlarmTime.Hours   = total / 3600;
+    alarm.AlarmTime.Minutes = (total % 3600) / 60;
+    alarm.AlarmTime.Seconds = total % 60;
+
+    alarm.Alarm = RTC_ALARM_A;
+
+    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+    HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN);
 }
 
 uint8_t tx_mode_start(uint32_t max_size, uint32_t timeout)
@@ -266,7 +294,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
                 }
             }
 
-            if (connected && (!connected_to_node))
+            if (connected)
             {
                 uart_printf("[GATEWAY_ADV] node %02X in connection, slot %d\n", dev_id, slot);
                 connected_to_gateway = 1;
@@ -292,7 +320,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         {
             // Expect the packet to include gateway id in receive_packet[1] and the node list in 2..6
             if (size != 7)  break;
-
+            if (connected_to_gateway) break;
             dest = receive_packet[1];
 
             uint8_t connected = 0;
@@ -435,194 +463,216 @@ void node_check(uint32_t timeout_ms)
 }
 sensor_typedef m_sensor;
 
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_RTC_Init(void);
+
 int main(void)
 {
 
   HAL_Init();
 
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
 
+  /* USER CODE BEGIN SysInit */
 
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
-
+  MX_RTC_Init();
 
   SX1278_hw.dio0.port =GPIOA;
-  SX1278_hw.dio0.pin = GPIO_PIN_2;
-  SX1278_hw.nss.port = GPIOA;
-  SX1278_hw.nss.pin = GPIO_PIN_4;
-  SX1278_hw.reset.port = GPIOA;
-  SX1278_hw.reset.pin = GPIO_PIN_3;
-  SX1278_hw.spi = &hspi1;
+    SX1278_hw.dio0.pin = GPIO_PIN_2;
+    SX1278_hw.nss.port = GPIOA;
+    SX1278_hw.nss.pin = GPIO_PIN_4;
+    SX1278_hw.reset.port = GPIOA;
+    SX1278_hw.reset.pin = GPIO_PIN_3;
+    SX1278_hw.spi = &hspi1;
 
-   SX1278.hw = &SX1278_hw;
+     SX1278.hw = &SX1278_hw;
 
-    	uart_printf("Configuring LoRa module\r\n");
-    	SX1278_init(&SX1278, 433000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
-    	SX1278_LORA_BW_250KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 15);
-    	uart_printf("Done configuring LoRaModule\r\n");
-    	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-    	uint32_t last_node_adv = 0;
-    	uint32_t last_gateway_connect = 0;
-    	uint32_t last_node_connect = 0;
-    	uint8_t send_node_beacon = 0;
-    	while (1)
-    	{
-    	    /* ---------- RX polling ---------- */
-    	    uint8_t rx_size = rx_mode_standby(receive_packet);
+      	uart_printf("Configuring LoRa module\r\n");
+      	SX1278_init(&SX1278, 433000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
+      	SX1278_LORA_BW_250KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 15);
+      	uart_printf("Done configuring LoRaModule\r\n");
+      	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
+      	uint32_t last_node_adv = 0;
+      	uint32_t last_gateway_connect = 0;
+      	uint32_t last_node_connect = 0;
+      	uint8_t send_node_beacon = 0;
+      	for (uint8_t i=0;i<8;i++)
+      	{
+      		sensor_packet[i] = dev_id;
+      	};
 
-    	    if (rx_size > 0)
-    	    {
-    	        packet_process(receive_packet, rx_size);
-    	    }
-    	    // node avdvertise
-    	    uint8_t node_count = 0;
-    	    for (uint8_t i = 0; i < 5; i++)
-    	    {
-    	    	if (connected_node[i] != 0) node_count ++;
-    	    }
+  while (1)
+  {
+	  /* ---------- RX polling ---------- */
+	      	    uint8_t rx_size = rx_mode_standby(receive_packet);
 
-    	    if (node_count <5 && connected_to_gateway && interval_check(&last_node_adv, 7000))
-    	    {
-    	    	uint8_t tx_size = packet_build(NODE_ADV_CMD, transmit_packet);
-    	    	    		tx_mode_start(tx_size, 1000);
-    	    	    		tx_mode_send(transmit_packet, tx_size, 1000);
-    	    	    		rx_mode_start(65, 1000);
-    	    }
+	      	    if (rx_size > 0)
+	      	    {
+	      	        packet_process(receive_packet, rx_size);
+	      	    }
+	      	    // node avdvertise
+	      	    uint8_t node_count = 0;
+	      	    for (uint8_t i = 0; i < 5; i++)
+	      	    {
+	      	    	if (connected_node[i] != 0) node_count ++;
+	      	    }
 
-    	    /* ---------- Connection handling ---------- */
-    	    if (gateway_available &&
-    	        !connected_to_gateway &&
-    	        !connected_to_node &&
-				interval_check(&last_gateway_connect, 2000))
-    	    {
-    	        uint8_t tx_size = packet_build(CONNECT_GATEWAY_CMD, transmit_packet);
+	      	    if (node_count <5 && connected_to_gateway && interval_check(&last_node_adv, 7000))
+	      	    {
+	      	    	uint8_t tx_size = packet_build(NODE_ADV_CMD, transmit_packet);
+	      	    	    		tx_mode_start(tx_size, 1000);
+	      	    	    		tx_mode_send(transmit_packet, tx_size, 1000);
+	      	    	    		rx_mode_start(65, 1000);
+	      	    }
 
-    	        tx_mode_start(tx_size, 500);
-    	        tx_mode_send(transmit_packet, tx_size, 500);
-    	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
-    	    }
-    	    else if (node_available &&
-    	             !connected_to_node &&
-    	             !connected_to_gateway &&
-					 interval_check(&last_node_connect, 2000))
-    	    {
+	      	    /* ---------- Connection handling ---------- */
+	      	    if (gateway_available &&
+	      	        !connected_to_gateway &&
+	  				interval_check(&last_gateway_connect, 2000))
+	      	    {
+	      	        uint8_t tx_size = packet_build(CONNECT_GATEWAY_CMD, transmit_packet);
 
-    	        uint8_t tx_size = packet_build(CONNECT_NODE_CMD, transmit_packet);
+	      	        tx_mode_start(tx_size, 500);
+	      	        tx_mode_send(transmit_packet, tx_size, 500);
+	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+	      	    }
+	      	    else if (node_available &&
+	      	             !connected_to_node &&
+	      	             !connected_to_gateway &&
+	  					 interval_check(&last_node_connect, 2000))
+	      	    {
 
-    	        tx_mode_start(tx_size, 500);
-    	        tx_mode_send(transmit_packet, tx_size, 500);
-    	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
-    	    }
+	      	        uint8_t tx_size = packet_build(CONNECT_NODE_CMD, transmit_packet);
 
-    	    if (beacon_start && connected_to_gateway && !connected_to_node)
-    	    {
-    	    	if (slot < 3)
-    	    	{
-    	    		if (slot_sent && !send_node_beacon)
-    	    		{
-    	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
-    	    			tx_mode_start(8, 500); tx_mode_send(transmit_packet, tx_size, 500);
-    	    			rx_mode_start(65, 1000); send_node_beacon = 1;
-    	    		}
-    	    	}
-    	    	else
-    	    	{
-    	    		if (!send_node_beacon)
-    	    		{
-    	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
-    	    			tx_mode_start(8, 500); tx_mode_send(transmit_packet, tx_size, 500);
-    	    			rx_mode_start(65, 1000); send_node_beacon = 1;
-    	    		}
-    	    	}
-    	    }
+	      	        tx_mode_start(tx_size, 500);
+	      	        tx_mode_send(transmit_packet, tx_size, 500);
+	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+	      	    }
 
-    	    /* ---------- TDMA parent slot ---------- */
-    	    if (beacon_start &&
-    	        connected_to_gateway &&
-    	        !connected_to_node)
-    	    {
+	      	    if (beacon_start && connected_to_gateway && !connected_to_node)
+	      	    {
+	      	    	if (slot < 3)
+	      	    	{
+	      	    		if (slot_sent && !send_node_beacon)
+	      	    		{
+	      	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
+	      	    			tx_mode_start(8, 500); tx_mode_send(transmit_packet, tx_size, 500);
+	      	    			rx_mode_start(65, 1000); send_node_beacon = 1;
+	      	    		}
+	      	    	}
+	      	    	else
+	      	    	{
+	      	    		if (!send_node_beacon)
+	      	    		{
+	      	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
+	      	    			tx_mode_start(8, 500); tx_mode_send(transmit_packet, tx_size, 500);
+	      	    			rx_mode_start(65, 1000); send_node_beacon = 1;
+	      	    		}
+	      	    	}
+	      	    }
 
-    	        uint32_t now = HAL_GetTick() - beacon_tick;
+	      	    /* ---------- TDMA parent slot ---------- */
+	      	    if (beacon_start &&
+	      	        connected_to_gateway &&
+	      	        !connected_to_node)
+	      	    {
 
-    	        uint32_t slot_start = slot * TDMA_SLOT_TIME;
-    	        uint32_t tx_window_start = slot_start + TDMA_GUARD_TIME;
-    	        uint32_t tx_window_end   = slot_start + TDMA_SLOT_TIME - TDMA_GUARD_TIME;
+	      	        uint32_t now = HAL_GetTick() - beacon_tick;
 
-    	        if (!slot_sent &&
-    	            now >= tx_window_start &&
-    	            now < tx_window_end)
-    	        {
-    	            uint8_t tx_size =
-    	                packet_build(SENSOR_PACKET_CMD, transmit_packet);
+	      	        uint32_t slot_start = slot * TDMA_SLOT_TIME;
+	      	        uint32_t tx_window_start = slot_start + TDMA_GUARD_TIME;
+	      	        uint32_t tx_window_end   = slot_start + TDMA_SLOT_TIME - TDMA_GUARD_TIME;
 
-    	            uint32_t remaining = tx_window_end - now;
+	      	        if (!slot_sent &&
+	      	            now >= tx_window_start &&
+	      	            now < tx_window_end)
+	      	        {
+	      	            uint8_t tx_size =
+	      	                packet_build(SENSOR_PACKET_CMD, transmit_packet);
 
-    	            tx_mode_start(tx_size, remaining);
-    	            uint8_t ret = tx_mode_send(transmit_packet, tx_size, 500);
-    	            uart_printf("send sensor: %d\n", ret);
-    	            HAL_Delay(300);
-    	             tx_size = packet_build(FORWARD_PACKET_CMD, transmit_packet);
-    	             tx_mode_start(tx_size, remaining);
-    	            ret = tx_mode_send(transmit_packet, tx_size, 500);
-    	            uart_printf("send forward: %d\n", ret);
-    	            slot_sent = 1;
-    	        }
+	      	            uint32_t remaining = tx_window_end - now;
 
-    	        /* end of TDMA frame */
-    	        if (now >= TDMA_SLOT_TIME * TDMA_NUM_SLOTS)
-    	        {
-    	        	send_node_beacon = 0;
-    	            beacon_start = 0;
-    	            slot_sent    = 0;
-    	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
-    	            uart_printf("[TDMA] parent frame ended\n");
-    	        }
-    	    }
+	      	            tx_mode_start(tx_size, remaining);
+	      	            uint8_t ret = tx_mode_send(transmit_packet, tx_size, 500);
+	      	            uart_printf("send sensor: %d\n", ret);
+	      	            HAL_Delay(300);
+	      	             tx_size = packet_build(FORWARD_PACKET_CMD, transmit_packet);
+	      	             tx_mode_start(tx_size, remaining);
+	      	            ret = tx_mode_send(transmit_packet, tx_size, 500);
+	      	            uart_printf("send forward: %d\n", ret);
+	      	            slot_sent = 1;
+	      	            memset(forward_sensor_packet,0,65);
+	      	        }
 
-    	    /* ---------- TDMA child slot ---------- */
-    	    if (beacon_child_start &&
-    	        !connected_to_gateway &&
-    	        connected_to_node)
-    	    {
-    	        uint32_t now = HAL_GetTick() - beacon_child_tick;
+	      	        /* end of TDMA frame */
+	      	        if (now >= TDMA_SLOT_TIME * TDMA_NUM_SLOTS)
+	      	        {
+	      	        	send_node_beacon = 0;
+	      	            beacon_start = 0;
+	      	            slot_sent    = 0;
+	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+	      	            uart_printf("[TDMA] parent frame ended\n");
+	      	        }
+	      	    }
 
-    	        uint32_t slot_start = slot * TDMA_CHILD_SLOT_TIME;
-    	        uint32_t tx_window_start = slot_start + TDMA_CHILD_GUARD_TIME;
-    	        uint32_t tx_window_end   = slot_start + TDMA_CHILD_SLOT_TIME - TDMA_CHILD_GUARD_TIME;
+	      	    /* ---------- TDMA child slot ---------- */
+	      	    if (beacon_child_start &&
+	      	        !connected_to_gateway &&
+	      	        connected_to_node)
+	      	    {
+	      	        uint32_t now = HAL_GetTick() - beacon_child_tick;
 
-    	        if (!slot_sent &&
-    	            now >= tx_window_start &&
-    	            now < tx_window_end)
-    	        {
-    	            uint8_t tx_size =
-    	                packet_build(FORWARD_PACKET_CMD, transmit_packet);
+	      	        uint32_t slot_start = slot * TDMA_CHILD_SLOT_TIME;
+	      	        uint32_t tx_window_start = slot_start + TDMA_CHILD_GUARD_TIME;
+	      	        uint32_t tx_window_end   = slot_start + TDMA_CHILD_SLOT_TIME - TDMA_CHILD_GUARD_TIME;
 
-    	            uint32_t remaining = tx_window_end - now;
+	      	        if (!slot_sent &&
+	      	            now >= tx_window_start &&
+	      	            now < tx_window_end)
+	      	        {
+	      	            uint8_t tx_size =
+	      	                packet_build(FORWARD_PACKET_CMD, transmit_packet);
 
-    	            tx_mode_start(tx_size, remaining / 2);
-    	            tx_mode_send(transmit_packet, tx_size, remaining / 2);
+	      	            uint32_t remaining = tx_window_end - now;
 
-    	            slot_sent = 1;
-    	        }
+	      	            tx_mode_start(tx_size, remaining / 2);
+	      	            tx_mode_send(transmit_packet, tx_size, remaining / 2);
 
-    	        /* end of TDMA child frame */
-    	        if (now >= TDMA_CHILD_SLOT_TIME * TDMA_CHILD_NUM_SLOTS)
-    	        {
-    	            beacon_child_start = 0;
-    	            slot_sent          = 0;
-    	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
-    	            uart_printf("[TDMA] child frame ended\n");
-    	        }
-    	    }
+	      	            slot_sent = 1;
+	      	        }
 
-    	    HAL_Delay(200);   // cooperative scheduling
-    	}
+	      	        /* end of TDMA child frame */
+	      	        if (now >= TDMA_CHILD_SLOT_TIME * TDMA_CHILD_NUM_SLOTS)
+	      	        {
+	      	            beacon_child_start = 0;
+	      	            slot_sent          = 0;
+	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+	      	            uart_printf("[TDMA] child frame ended\n");
+	      	        }
+	      	    }
 
-    	}
+	      	    HAL_Delay(200);   // cooperative scheduling
+  }
+  /* USER CODE END 3 */
+}
 
 
 void SystemClock_Config(void)
@@ -631,13 +681,12 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL2;
@@ -658,7 +707,8 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC|RCC_PERIPHCLK_ADC;
+  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
   PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV2;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -666,23 +716,15 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
+
 static void MX_ADC1_Init(void)
 {
 
-  /* USER CODE BEGIN ADC1_Init 0 */
-  /* USER CODE END ADC1_Init 0 */
+
 
   ADC_ChannelConfTypeDef sConfig = {0};
 
-  /* USER CODE BEGIN ADC1_Init 1 */
-  /* USER CODE END ADC1_Init 1 */
-  /** Common config
-  */
+
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -694,8 +736,7 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
-  /** Configure Regular Channel
-  */
+
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
@@ -703,24 +744,14 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN ADC1_Init 2 */
-  /* USER CODE END ADC1_Init 2 */
 
 }
 
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
+
 static void MX_I2C1_Init(void)
 {
 
-  /* USER CODE BEGIN I2C1_Init 0 */
-  /* USER CODE END I2C1_Init 0 */
 
-  /* USER CODE BEGIN I2C1_Init 1 */
-  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -734,18 +765,52 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
+
+}
+
+
+static void MX_RTC_Init(void)
+{
+
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef DateToUpdate = {0};
+
+
+  hrtc.Instance = RTC;
+  hrtc.Init.AsynchPrediv = RTC_AUTO_1_SECOND;
+  hrtc.Init.OutPut = RTC_OUTPUTSOURCE_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+
+  sTime.Hours = 0;
+  sTime.Minutes = 0;
+  sTime.Seconds = 0;
+
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
+  DateToUpdate.Month = RTC_MONTH_JANUARY;
+  DateToUpdate.Date = 1;
+  DateToUpdate.Year = 0;
+
+  if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BIN) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
 }
 
 
 static void MX_SPI1_Init(void)
 {
 
-  /* USER CODE BEGIN SPI1_Init 0 */
-  /* USER CODE END SPI1_Init 0 */
 
-  /* USER CODE BEGIN SPI1_Init 1 */
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
@@ -762,24 +827,15 @@ static void MX_SPI1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI1_Init 2 */
-  /* USER CODE END SPI1_Init 2 */
+
 
 }
 
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
+
 static void MX_USART1_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART1_Init 0 */
-  /* USER CODE END USART1_Init 0 */
 
-  /* USER CODE BEGIN USART1_Init 1 */
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -792,10 +848,10 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-  /* USER CODE END USART1_Init 2 */
+
 
 }
+
 
 static void MX_GPIO_Init(void)
 {
@@ -835,25 +891,35 @@ static void MX_GPIO_Init(void)
 
 }
 
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  /* USER CODE BEGIN Callback 0 */
-  /* USER CODE END Callback 0 */
+
   if (htim->Instance == TIM4) {
     HAL_IncTick();
   }
-  /* USER CODE BEGIN Callback 1 */
-  /* USER CODE END Callback 1 */
+
 }
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
+
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* USER CODE END Error_Handler_Debug */
+
 }
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
+{
+    RTC_TimeTypeDef time;
+    RTC_DateTypeDef date;
 
+    HAL_RTC_GetTime(hrtc, &time, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(hrtc, &date, RTC_FORMAT_BIN);
 
+    uart_printf("RTC IRQ: %02d:%02d:%02d\r\n",
+           time.Hours,
+           time.Minutes,
+           time.Seconds);
+    SystemClock_Config ();
+    	HAL_ResumeTick();
+    /* Re-arm alarm for next 30 seconds */
+    RTC_SetAlarmIn(10);
+}
