@@ -13,7 +13,7 @@
 #define SENSOR_PACKET_LEN   8    // sensor fields you copy into TX (3..10 -> 8 bytes)
 #define CONNECTED_NODE_COUNT 10
 
-#define dev_id 0x36
+#define dev_id 0x18
 
 #define GATEWAY_ADV_CMD 0X22
 #define GATEWAY_BEACON_CMD 0X33
@@ -45,9 +45,9 @@ uint8_t con_dev = 0;                 // number of connected devices (maintain co
 uint8_t connected_node[CONNECTED_NODE_COUNT] = {0};
 uint8_t dest = 0xFF;                 // default destination (0xFF = broadcast)
 uint8_t receive_packet[130];
+uint8_t node_frame_check[10] = {0};
 uint8_t connected_to_gateway = 0;
-uint32_t gateway_timeout_check;
-uint32_t node_timeout_check;
+
 uint8_t connected_to_node = 0;
 
 uint32_t transmit_packet_size;
@@ -63,12 +63,14 @@ uint32_t beacon_child_tick = 0;
 uint8_t slot_child = 0;
 uint8_t slot_sent = 0;
 uint8_t frame_end = 0;
-
+uint8_t in_frame = 0;
 SX1278_hw_t SX1278_hw;
 SX1278_t SX1278;
 
 
+
 ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
 
 I2C_HandleTypeDef hi2c1;
 
@@ -90,6 +92,7 @@ static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_RTC_Init(void);
+static void MX_ADC2_Init(void);
 void uart_printf(const char *format,...)
 {
 	char packet[128];
@@ -174,6 +177,8 @@ uint8_t rx_mode_standby(uint8_t *packet)
         for (uint8_t i = 0; i < ret; i++)
             uart_printf("%02X ", packet[i]);
         uart_printf("\n");
+        uart_printf("RSSI: %d dBm\r\n", SX1278_RSSI_LoRa(&SX1278));
+        uart_printf("SNR: %d dB\r\n", SX1278_SNR_LoRa(&SX1278));
     if (ret > 100)
     {
     	rx_mode_start(60, 100);
@@ -317,6 +322,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
             else
             {
                 uart_printf("[GATEWAY_ADV] gateway no empty slot, cannot join\n");
+                connected_to_gateway = 0;
             }
         }
         break;
@@ -353,7 +359,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
                 node_available = 0;
                 dest = receive_packet[1];
                 connected_to_gateway = 0;
-                node_timeout_check = HAL_GetTick();
+
             }
             else if (empty_slot)
             {
@@ -365,6 +371,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
             else
             {
                 uart_printf("[NODE_ADV] dest %02X have no empty slot, cannot join\n",receive_packet[1]);
+                connected_to_node = 0;
             }
         }
         break;
@@ -379,7 +386,16 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         	break;
         case NODE_BEACON_CMD:
         			if (connected_to_gateway) break;
-                	if (receive_packet[slot + 3] != dev_id) break;
+
+                	if (receive_packet[slot + 3] != dev_id)
+                		{
+                			if (receive_packet[2] - frame > 5 && connected_to_node)
+                			{
+                				connected_to_node = 0;
+                				dest = 0;
+                			}
+                			break;
+                		}
                 	beacon_child_start = 1;
                 	frame = receive_packet[2];
                 	beacon_child_tick = HAL_GetTick();
@@ -390,12 +406,14 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
         	if (receive_packet[1] != dev_id) break;
         	uint8_t child_pos = 0;
         	uint8_t node_id_check = 0;
+
         	for (uint8_t i = 0; i < 10; i++)
         	{
         		if (connected_node[i] == receive_packet[2])
         			{
         			child_pos = i;
         			node_id_check = 1;
+        			node_frame_check[i] = receive_packet[4];
         			break;
         			}
         	}
@@ -418,7 +436,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
                 		            else if (connected_node[i] == 0)
                 		            {
                 		                connected_node[i] = receive_packet[1];
-
+                		                node_frame_check[i] = frame;
 
                 		                uart_printf("Added dev %02X\n", receive_packet[1]);
                 		                break;
@@ -443,12 +461,83 @@ bool interval_check(uint32_t *target, uint32_t timeout)
     return false;
 }
 
-void frame_timeout_check(uint8_t frame_timeout)
+void frame_timeout_check(uint8_t *frame_timeout, uint8_t frame)
 {
+  for (uint8_t i = 0; i < 10; i ++)
+  {
+	  if (frame - frame_timeout[i] > 5 && (connected_node[i] !=0))
+	  {
 
+		  connected_node[i] = 0;
+	  }
+  }
 }
 
 sensor_typedef m_sensor;
+
+#include <stdlib.h>
+
+void get_data(uint8_t *sensor_packet, sensor_typedef *m_sensor)
+{
+    /* ---- Fake sensor data (scaled x100) ---- */
+    static int16_t temp     = 2023;  // 20.23 C
+    static int16_t humidity = 5344;  // 53.44 %
+    static int16_t soil     = 4500;  // 45.00 %
+    static int16_t battery  = 4100;  // 41.00 %
+
+    /* Small random drift */
+    temp     += (rand() % 11) - 5;    // ±0.05 C
+    humidity += (rand() % 21) - 10;   // ±0.10 %
+    soil     += (rand() % 31) - 15;   // ±0.15 %
+    battery  += (rand() % 5)  - 2;    // ±0.02 %
+
+    /* Clamp ranges */
+    if (temp < 1800) temp = 1800;
+    if (temp > 3500) temp = 3500;
+
+    if (humidity < 3000) humidity = 3000;
+    if (humidity > 9000) humidity = 9000;
+
+    if (soil < 0) soil = 0;
+    if (soil > 10000) soil = 10000;
+
+    if (battery < 3600) battery = 3600;
+    if (battery > 4200) battery = 4200;
+
+    /* Assign to struct */
+    m_sensor->temp          = temp;
+    m_sensor->humidity      = humidity;
+    m_sensor->soil_moisture = soil;
+    m_sensor->battery       = battery;
+
+    /* ---- Pack data ---- */
+    sensor_packet[0] = (uint8_t)(temp >> 8);
+    sensor_packet[1] = (uint8_t)(temp & 0xFF);
+
+    sensor_packet[2] = (uint8_t)(humidity >> 8);
+    sensor_packet[3] = (uint8_t)(humidity & 0xFF);
+
+    sensor_packet[4] = (uint8_t)(soil >> 8);
+    sensor_packet[5] = (uint8_t)(soil & 0xFF);
+
+    sensor_packet[6] = (uint8_t)(battery >> 8);
+    sensor_packet[7] = (uint8_t)(battery & 0xFF);
+
+    /* ---- Debug print ---- */
+    uart_printf("Temp: %u.%02u C | ",
+                temp / 100, temp % 100);
+
+    uart_printf("Humid: %u.%02u %% | ",
+                humidity / 100, humidity % 100);
+
+    uart_printf("Moisture: %u.%02u %% | ",
+                soil / 100, soil % 100);
+
+    uart_printf("Battery: %u.%02u %%\r\n",
+                battery / 100, battery % 100);
+}
+
+
 
 int main(void)
 {
@@ -479,179 +568,201 @@ int main(void)
   MX_USART1_UART_Init();
   MX_ADC1_Init();
   MX_RTC_Init();
+  MX_ADC2_Init();
+  /* USER CODE BEGIN 2 */
 
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
   SX1278_hw.dio0.port =GPIOA;
-     SX1278_hw.dio0.pin = GPIO_PIN_2;
-     SX1278_hw.nss.port = GPIOA;
-     SX1278_hw.nss.pin = GPIO_PIN_4;
-     SX1278_hw.reset.port = GPIOA;
-     SX1278_hw.reset.pin = GPIO_PIN_3;
-     SX1278_hw.spi = &hspi1;
+       SX1278_hw.dio0.pin = GPIO_PIN_2;
+       SX1278_hw.nss.port = GPIOA;
+       SX1278_hw.nss.pin = GPIO_PIN_4;
+       SX1278_hw.reset.port = GPIOA;
+       SX1278_hw.reset.pin = GPIO_PIN_3;
+       SX1278_hw.spi = &hspi1;
 
-      SX1278.hw = &SX1278_hw;
+        SX1278.hw = &SX1278_hw;
+        srand(HAL_GetTick());
 
-       	uart_printf("Configuring LoRa module\r\n");
-       	SX1278_init(&SX1278, 433000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
-       	SX1278_LORA_BW_250KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 15);
-       	uart_printf("Done configuring LoRaModule\r\n");
-       	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
-       	uint32_t last_node_adv = 0;
-       	uint32_t last_gateway_connect = 0;
-       	uint32_t last_node_connect = 0;
-       	uint8_t send_node_beacon = 0;
-       	for (uint8_t i=0;i<8;i++)
-       	{
-       		sensor_packet[i] = dev_id;
-       	};
+         	uart_printf("Configuring LoRa module\r\n");
+         	SX1278_init(&SX1278, 433000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
+         	SX1278_LORA_BW_250KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 15);
+         	uart_printf("Done configuring LoRaModule\r\n");
+         	SX1278_LoRaEntryRx(&SX1278, 16, 2000);
+         	uint32_t last_node_adv = 0;
+         	uint32_t last_gateway_connect = 0;
+         	uint32_t last_node_connect = 0;
+         	uint8_t send_node_beacon = 0;
+         	uint8_t data_ready = 0;
+         	for (uint8_t i=0;i<8;i++)
+         	{
+         		sensor_packet[i] = dev_id;
+         	};
 
-   while (1)
-   {
- 	  /* ---------- RX polling ---------- */
- 	      	    uint8_t rx_size = rx_mode_standby(receive_packet);
+     while (1)
+     {
+    	 if (!data_ready)
+    	 {
+    		 get_data(sensor_packet, &m_sensor);
 
- 	      	    if (rx_size > 0)
- 	      	    {
- 	      	        packet_process(receive_packet, rx_size);
- 	      	    }
- 	      	    // node avdvertise
- 	      	    uint8_t node_count = 0;
- 	      	    for (uint8_t i = 0; i < 10; i++)
- 	      	    {
- 	      	    	if (connected_node[i] != 0) node_count ++;
- 	      	    }
-
- 	      	    if (node_count <10 && connected_to_gateway && interval_check(&last_node_adv, 35000))
- 	      	    {
- 	      	    	uint8_t tx_size = packet_build(NODE_ADV_CMD, transmit_packet);
- 	      	    	    		tx_mode_start(tx_size, 1000);
- 	      	    	    		tx_mode_send(transmit_packet, tx_size, 1000);
- 	      	    	    		rx_mode_start(65, 1000);
- 	      	    }
-
- 	      	    /* ---------- Connection handling ---------- */
- 	      	    if (gateway_available &&
- 	      	        !connected_to_gateway &&
- 	  				interval_check(&last_gateway_connect, 2000))
- 	      	    {
- 	      	        uint8_t tx_size = packet_build(CONNECT_GATEWAY_CMD, transmit_packet);
-
- 	      	        tx_mode_start(tx_size, 500);
- 	      	        tx_mode_send(transmit_packet, tx_size, 500);
- 	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
- 	      	    }
- 	      	    else if (node_available &&
- 	      	             !connected_to_node &&
- 	      	             !connected_to_gateway &&
- 	  					 interval_check(&last_node_connect, 2000))
- 	      	    {
-
- 	      	        uint8_t tx_size = packet_build(CONNECT_NODE_CMD, transmit_packet);
-
- 	      	        tx_mode_start(tx_size, 500);
- 	      	        tx_mode_send(transmit_packet, tx_size, 500);
- 	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
- 	      	    }
-
- 	      	    // node beacon
- 	      	    if (!send_node_beacon && beacon_start && connected_to_gateway && !connected_to_node)
- 	      	    {
-
- 	      	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
- 	      	    			tx_mode_start(tx_size, 500); tx_mode_send(transmit_packet, tx_size, 500);
- 	      	    			rx_mode_start(65, 1000); send_node_beacon = 1;
+    		 data_ready = 1;
+    	 }
 
 
- 	      	    }
 
- 	      	    /* ---------- TDMA parent slot ---------- */
- 	      	    if (beacon_start &&
- 	      	        connected_to_gateway &&
- 	      	        !connected_to_node)
- 	      	    {
+   	  /* ---------- RX polling ---------- */
+   	      	    uint8_t rx_size = rx_mode_standby(receive_packet);
 
- 	      	        uint32_t now = HAL_GetTick() - beacon_tick;
+   	      	    if (rx_size > 0)
+   	      	    {
+   	      	        packet_process(receive_packet, rx_size);
+   	      	    }
 
- 	      	        uint32_t slot_start = (slot * TDMA_SLOT_TIME) + 30000;
- 	      	        uint32_t tx_window_start = slot_start + TDMA_GUARD_TIME;
- 	      	        uint32_t tx_window_end   = slot_start + TDMA_SLOT_TIME - TDMA_GUARD_TIME;
+   	      	    frame_timeout_check(node_frame_check, frame);
 
- 	      	        if (!slot_sent &&
- 	      	            now >= tx_window_start &&
- 	      	            now < tx_window_end)
- 	      	        {
- 	      	            uint8_t tx_size =
- 	      	                packet_build(SENSOR_PACKET_CMD, transmit_packet);
+   	      	    // node avdvertise
+   	      	    uint8_t node_count = 0;
+   	      	    for (uint8_t i = 0; i < 10; i++)
+   	      	    {
+   	      	    	if (connected_node[i] != 0) node_count ++;
+   	      	    }
 
- 	      	            uint32_t remaining = tx_window_end - now;
+   	      	    if (!in_frame && node_count <10 && connected_to_gateway && interval_check(&last_node_adv, 5000))
+   	      	    {
+   	      	    	uint8_t tx_size = packet_build(NODE_ADV_CMD, transmit_packet);
+   	      	    	    		tx_mode_start(tx_size, 1000);
+   	      	    	    		tx_mode_send(transmit_packet, tx_size, 1000);
+   	      	    	    		rx_mode_start(65, 1000);
+   	      	    }
 
- 	      	            tx_mode_start(tx_size, remaining);
- 	      	            uint8_t ret = tx_mode_send(transmit_packet, tx_size, 500);
- 	      	            uart_printf("send sensor: %d\n", ret);
- 	      	            HAL_Delay(300);
- 	      	             tx_size = packet_build(FORWARD_PACKET_CMD, transmit_packet);
- 	      	             tx_mode_start(tx_size, remaining);
- 	      	            ret = tx_mode_send(transmit_packet, tx_size, 500);
- 	      	            uart_printf("send forward: %d\n", ret);
- 	      	            slot_sent = 1;
- 	      	            memset(forward_sensor_packet,0,65);
- 	      	        }
+   	      	    /* ---------- Connection handling ---------- */
+   	      	    if (gateway_available &&
+   	      	        !connected_to_gateway &&
+   	  				interval_check(&last_gateway_connect, 2000))
+   	      	    {
+   	      	        uint8_t tx_size = packet_build(CONNECT_GATEWAY_CMD, transmit_packet);
 
- 	      	        /* end of TDMA frame */
- 	      	        if (now >= TDMA_SLOT_TIME * TDMA_NUM_SLOTS + 30000)
- 	      	        {
- 	      	        	send_node_beacon = 0;
- 	      	            beacon_start = 0;
- 	      	            slot_sent    = 0;
- 	      	            frame_end = 1;
- 	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
- 	      	            uart_printf("[TDMA] parent frame ended\n");
- 	      	        }
- 	      	    }
+   	      	        tx_mode_start(tx_size, 500);
+   	      	        tx_mode_send(transmit_packet, tx_size, 500);
+   	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+   	      	    }
+   	      	    else if (node_available &&
+   	      	             !connected_to_node &&
+   	      	             !connected_to_gateway &&
+   	  					 interval_check(&last_node_connect, 2000))
+   	      	    {
 
- 	      	    /* ---------- TDMA child slot ---------- */
- 	      	    if (beacon_child_start &&
- 	      	        !connected_to_gateway &&
- 	      	        connected_to_node)
- 	      	    {
- 	      	        uint32_t now = HAL_GetTick() - beacon_child_tick;
+   	      	        uint8_t tx_size = packet_build(CONNECT_NODE_CMD, transmit_packet);
 
- 	      	        uint32_t slot_start = slot * TDMA_CHILD_SLOT_TIME;
- 	      	        uint32_t tx_window_start = slot_start + TDMA_CHILD_GUARD_TIME;
- 	      	        uint32_t tx_window_end   = slot_start + TDMA_CHILD_SLOT_TIME - TDMA_CHILD_GUARD_TIME;
+   	      	        tx_mode_start(tx_size, 500);
+   	      	        tx_mode_send(transmit_packet, tx_size, 500);
+   	      	        rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+   	      	    }
 
- 	      	        if (!slot_sent &&
- 	      	            now >= tx_window_start &&
- 	      	            now < tx_window_end)
- 	      	        {
- 	      	            uint8_t tx_size =
- 	      	                packet_build(FORWARD_PACKET_CMD, transmit_packet);
+   	      	    // node beacon
+   	      	    if (!send_node_beacon && beacon_start && connected_to_gateway && !connected_to_node)
+   	      	    {
 
- 	      	            uint32_t remaining = tx_window_end - now;
+   	      	    			uint8_t tx_size = packet_build(NODE_BEACON_CMD, transmit_packet);
+   	      	    			tx_mode_start(tx_size, 500); tx_mode_send(transmit_packet, tx_size, 500);
+   	      	    			rx_mode_start(65, 1000); send_node_beacon = 1;
 
- 	      	            tx_mode_start(tx_size, remaining / 2);
- 	      	            tx_mode_send(transmit_packet, tx_size, remaining / 2);
 
- 	      	            slot_sent = 1;
- 	      	        }
+   	      	    }
 
- 	      	        /* end of TDMA child frame */
- 	      	        if (now >= TDMA_CHILD_SLOT_TIME * TDMA_CHILD_NUM_SLOTS)
- 	      	        {
- 	      	            beacon_child_start = 0;
- 	      	            slot_sent          = 0;
- 	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
- 	      	            uart_printf("[TDMA] child frame ended\n");
- 	      	        }
- 	      	    }
- 	      	    if (frame_end)
- 	      	    {
- 	      	    	uart_printf("hasta la vista\n");
- 	      	    	    		RTC_SetAlarmIn(10);
- 	      	    	    	HAL_SuspendTick();
- 	      	    }
- 	      	    HAL_Delay(200);   // cooperative scheduling
-   }
-  /* USER CODE END 3 */
+   	      	    /* ---------- TDMA parent slot ---------- */
+   	      	    if (beacon_start &&
+   	      	        connected_to_gateway &&
+   	      	        !connected_to_node)
+   	      	    {
+   	      	    	in_frame = 1;
+   	      	        uint32_t now = HAL_GetTick() - beacon_tick;
+
+   	      	        uint32_t slot_start = (slot * TDMA_SLOT_TIME) + 30000;
+   	      	        uint32_t tx_window_start = slot_start + TDMA_GUARD_TIME;
+   	      	        uint32_t tx_window_end   = slot_start + TDMA_SLOT_TIME - TDMA_GUARD_TIME;
+
+   	      	        if (!slot_sent &&
+   	      	            now >= tx_window_start &&
+   	      	            now < tx_window_end)
+   	      	        {
+   	      	            uint8_t tx_size =
+   	      	                packet_build(SENSOR_PACKET_CMD, transmit_packet);
+
+   	      	            uint32_t remaining = tx_window_end - now;
+
+   	      	            tx_mode_start(tx_size, remaining);
+   	      	            uint8_t ret = tx_mode_send(transmit_packet, tx_size, 500);
+   	      	            uart_printf("send sensor: %d\n", ret);
+   	      	            HAL_Delay(300);
+   	      	             tx_size = packet_build(FORWARD_PACKET_CMD, transmit_packet);
+   	      	             tx_mode_start(tx_size, remaining);
+   	      	            ret = tx_mode_send(transmit_packet, tx_size, 500);
+   	      	            uart_printf("send forward: %d\n", ret);
+   	      	            slot_sent = 1;
+   	      	            memset(forward_sensor_packet,0,65);
+   	      	        }
+
+   	      	        /* end of TDMA frame */
+   	      	        if (now >= TDMA_SLOT_TIME * TDMA_NUM_SLOTS + 30000)
+   	      	        {
+   	      	        	send_node_beacon = 0;
+   	      	            beacon_start = 0;
+   	      	            slot_sent    = 0;
+   	      	            frame_end = 1;
+   	      	            data_ready = 0;
+   	      	            in_frame = 0;
+   	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+   	      	            uart_printf("[TDMA] parent frame ended\n");
+   	      	        }
+   	      	    }
+
+   	      	    /* ---------- TDMA child slot ---------- */
+   	      	    if (beacon_child_start &&
+   	      	        !connected_to_gateway &&
+   	      	        connected_to_node)
+   	      	    {
+   	      	        uint32_t now = HAL_GetTick() - beacon_child_tick;
+
+   	      	        uint32_t slot_start = slot * TDMA_CHILD_SLOT_TIME;
+   	      	        uint32_t tx_window_start = slot_start + TDMA_CHILD_GUARD_TIME;
+   	      	        uint32_t tx_window_end   = slot_start + TDMA_CHILD_SLOT_TIME - TDMA_CHILD_GUARD_TIME;
+
+   	      	        if (!slot_sent &&
+   	      	            now >= tx_window_start &&
+   	      	            now < tx_window_end)
+   	      	        {
+   	      	            uint8_t tx_size =
+   	      	                packet_build(FORWARD_PACKET_CMD, transmit_packet);
+
+   	      	            uint32_t remaining = tx_window_end - now;
+
+   	      	            tx_mode_start(tx_size, remaining / 2);
+   	      	            tx_mode_send(transmit_packet, tx_size, remaining / 2);
+
+   	      	            slot_sent = 1;
+   	      	        }
+
+   	      	        /* end of TDMA child frame */
+   	      	        if (now >= TDMA_CHILD_SLOT_TIME * TDMA_CHILD_NUM_SLOTS)
+   	      	        {
+   	      	            beacon_child_start = 0;
+   	      	            slot_sent          = 0;
+   	      	            rx_mode_start(MAX_RX_PACKET_SIZE, 1000);
+   	      	            uart_printf("[TDMA] child frame ended\n");
+   	      	        }
+   	      	    }
+   	      	    if (frame_end)
+   	      	    {
+   	      	    	uart_printf("hasta la vista\n");
+
+   	      	    	    		RTC_SetAlarmIn(10);
+   	      	    	    	HAL_SuspendTick();
+   	      	    }
+   	      	    HAL_Delay(200);   // cooperative scheduling
+     }
 }
 
 /**
@@ -742,6 +853,51 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
 
 }
 
@@ -981,6 +1137,7 @@ void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
            time.Minutes,
            time.Seconds);
     frame_end = 0;
+
     SystemClock_Config ();
     	HAL_ResumeTick();
     /* Re-arm alarm for next 30 seconds */

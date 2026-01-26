@@ -17,6 +17,7 @@ SX1278.c:263:5:SX1278_receive	24	static
 SX1278.c:267:9:SX1278_available	16	static
 SX1278.c:271:9:SX1278_read	24	static
 SX1278.c:280:9:SX1278_RSSI_LoRa	24	static
-SX1278.c:287:9:SX1278_RSSI	24	static
-SX1278.c:294:6:SX1278_enable_invertIQ	16	static
-SX1278.c:300:6:SX1278_disable_invertIQ	16	static
+SX1278.c:286:9:SX1278_RSSI	24	static
+SX1278.c:293:6:SX1278_enable_invertIQ	16	static
+SX1278.c:299:6:SX1278_disable_invertIQ	16	static
+SX1278.c:305:8:SX1278_SNR_LoRa	24	static

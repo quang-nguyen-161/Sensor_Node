@@ -277,11 +277,10 @@ uint8_t SX1278_read(SX1278_t *module, uint8_t *rxBuf, uint8_t length) {
 	return length;
 }
 
-uint8_t SX1278_RSSI_LoRa(SX1278_t *module) {
-	uint32_t temp = 10;
-	temp = SX1278_SPIRead(module, LR_RegRssiValue); //Read RegRssiValue, Rssi value
-	temp = temp + 127 - 137; //127:Max RSSI, 137:RSSI offset
-	return (uint8_t) temp;
+int16_t SX1278_RSSI_LoRa(SX1278_t *module)
+{
+    uint8_t raw = SX1278_SPIRead(module, LR_RegPktRssiValue);
+    return (int16_t)(raw - 157);   // 433 MHz
 }
 
 uint8_t SX1278_RSSI(SX1278_t *module) {
@@ -301,6 +300,12 @@ void SX1278_disable_invertIQ(SX1278_t *module)
 {
 	SX1278_SPIWrite(module, 0x33, 0x27);
 	SX1278_SPIWrite(module, 0x3B, 0x1D);
+}
+
+int8_t SX1278_SNR_LoRa(SX1278_t *module)
+{
+    int8_t snr_raw = (int8_t)SX1278_SPIRead(module, LR_RegPktSnrValue);
+    return (snr_raw >> 2);   // divide by 4 → dB
 }
 
 

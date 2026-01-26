@@ -225,7 +225,7 @@ typedef struct {
 	uint8_t rxBuffer[SX1278_MAX_PACKET];
 	uint8_t readBytes;
 } SX1278_t;
-
+int8_t SX1278_SNR_LoRa(SX1278_t *module);
 /**
  * \brief Read byte from LoRa module
  *
@@ -450,7 +450,7 @@ uint8_t SX1278_read(SX1278_t *module, uint8_t *rxBuf, uint8_t length);
  *
  * \return     RSSI value
  */
-uint8_t SX1278_RSSI_LoRa(SX1278_t *module);
+int16_t SX1278_RSSI_LoRa(SX1278_t *module);
 
 /**
  * \brief Returns RSSI
